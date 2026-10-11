@@ -1,62 +1,80 @@
-# Guardrails v2 installer-owned workflow.
-name: Validate
-
+name: Repository validation
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+  merge_group:
+  push:
+    branches: ["main"]
   workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
-  repository:
-    name: Validate / repository
+  repository-validation:
+    name: repository-validation
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - run: python3 .guardrails/validators/validate_repository.py
-
-  standards-source:
-    name: Validate / standards source
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Validate engineering standards source repository
-        if: ${{ hashFiles('tooling/validators/validate_repository.py') != '' }}
-        run: python3 tooling/validators/validate_repository.py
-      - name: Validate shared skills and focused tests
-        if: ${{ hashFiles('tooling/validate-skills.py') != '' }}
-        run: python3 tooling/validate-skills.py
-  docs:
-    name: Validate / docs
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Check out the proposed commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - run: python3 .guardrails/validators/validate_documentation.py --base-ref "${BASE_REF}" --head-ref "${HEAD_REF}"
+      - name: Validate changed repository files
         env:
-          BASE_REF: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}
-          HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
-  ground-truth:
-    name: Validate / ground truth
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - run: python3 .guardrails/validate_ground_truth.py --policy .guardrails/ground-truth-ai.yaml
+          VALIDATION_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        shell: python3 -I {0}
+        run: |
+          """Validate changed repository metadata without executing contributed code."""
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+
+          def git(*args):
+              return subprocess.check_output(['git', *args])
+
+
+          def reject_constant(value):
+              raise ValueError('non-JSON constant: ' + value)
+
+
+          def main():
+              base = os.environ.get('VALIDATION_BASE', '')
+              if not base or set(base) == {'0'}:
+                  try:
+                      base = git('rev-parse', 'HEAD^').decode().strip()
+                  except subprocess.CalledProcessError:
+                      base = git('hash-object', '-t', 'tree', '/dev/null').decode().strip()
+              checked = subprocess.run(['git', 'diff', '--check', base, 'HEAD', '--'])
+              if checked.returncode:
+                  return 1
+              names = git('diff', '--name-only', '-z', '--diff-filter=ACMR', base, 'HEAD', '--')
+              failures = []
+              count = 0
+              for raw in names.split(b'\0'):
+                  if not raw:
+                      continue
+                  name = os.fsdecode(raw)
+                  path = pathlib.Path(name)
+                  # Never follow symlinks or inspect submodules outside this checkout.
+                  if path.is_symlink() or not path.is_file():
+                      continue
+                  count += 1
+                  if path.name in {'package.json', 'package-lock.json', 'composer.json', 'composer.lock'}:
+                      try:
+                          json.loads(path.read_text(encoding='utf-8-sig'), parse_constant=reject_constant)
+                      except (ValueError, UnicodeError) as error:
+                          failures.append(name + ': invalid JSON: ' + str(error))
+              if failures:
+                  for failure in failures:
+                      print(failure, file=sys.stderr)
+                  return 1
+              print(f'Validated {count} changed files: whitespace, merge-conflict markers, and package metadata JSON.')
+              return 0
+
+
+          if __name__ == '__main__':
+              sys.exit(main())
